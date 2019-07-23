@@ -18,7 +18,36 @@
 #include "base/pegasus_utils.h"
 #include "pegasus_io_service.h"
 
+#include <chrono>
+#include <map>
+#include <memory>
+#include <string>
+#include <thread>
+#include <sstream>
+#include <iterator>
+#include <regex>
+
+#include <prometheus-cpp/core/include/prometheus/registry.h>
+#include <prometheus-cpp/push/include/prometheus/gateway.h>
+
 using namespace ::dsn;
+
+static std::string GetHostName() {
+  char hostname[1024];
+
+  if (::gethostname(hostname, sizeof(hostname))) {
+    return {};
+  }
+  return hostname;
+}
+
+std::vector<std::string> s_split(const std::string& in, const std::string& delim) {
+    std::regex re{ delim };
+    return std::vector<std::string> {
+        std::sregex_token_iterator(in.begin(), in.end(), re, -1),
+        std::sregex_token_iterator()
+    };
+}
 
 namespace pegasus {
 namespace server {
@@ -43,11 +72,21 @@ pegasus_counter_reporter::pegasus_counter_reporter()
       _last_report_time_ms(0),
       _enable_logging(false),
       _enable_falcon(false),
-      _falcon_port(0)
+      _enable_prometheus(false),
+      _falcon_port(0),
+      _prometheus_port(0)
 {
 }
 
 pegasus_counter_reporter::~pegasus_counter_reporter() { stop(); }
+
+void pegasus_counter_reporter::prometheus_initialize(){
+    _prometheus_host = dsn_config_get_value_string(
+        "pegasus.server", "prometheus_host", "127.0.0.1", "prometheus gateway host");
+    _prometheus_port = (uint16_t)dsn_config_get_value_uint64(
+        "pegasus.server", "prometheus_port", 9091, "prometheus gateway port");
+    ddebug("prometheus init port = %d, host = %s", _prometheus_port, _prometheus_host.c_str());
+}
 
 void pegasus_counter_reporter::falcon_initialize()
 {
@@ -112,9 +151,16 @@ void pegasus_counter_reporter::start()
         "pegasus.server", "perf_counter_enable_logging", true, "perf_counter_enable_logging");
     _enable_falcon = dsn_config_get_value_bool(
         "pegasus.server", "perf_counter_enable_falcon", false, "perf_counter_enable_falcon");
+    _enable_prometheus = dsn_config_get_value_bool(
+        "pegasus.server", "perf_counter_enable_prometheus", true, "perf_counter_enable_prometheus");
 
+    _enable_falcon = true;
     if (_enable_falcon) {
         falcon_initialize();
+    }
+
+    if(_enable_prometheus) {
+        prometheus_initialize();
     }
 
     event_set_log_callback(libevent_log);
@@ -146,7 +192,7 @@ void pegasus_counter_reporter::update()
 {
     uint64_t now = dsn_now_ms();
     int64_t timestamp = now / 1000;
-
+    //_enable_falcon = true;
     perf_counters::instance().take_snapshot();
 
     if (_enable_logging) {
@@ -161,25 +207,72 @@ void pegasus_counter_reporter::update()
         ddebug("%s", oss.str().c_str());
     }
 
+
+    //_enable_falcon = true;
     if (_enable_falcon) {
         std::stringstream oss;
         oss << "[";
 
         bool first_append = true;
         _falcon_metric.timestamp = timestamp;
+
         perf_counters::instance().iterate_snapshot(
             [&oss, &first_append, this](const dsn::perf_counters::counter_snapshot &cs) {
                 _falcon_metric.metric = cs.name;
                 _falcon_metric.value = cs.value;
                 _falcon_metric.counterType = "GAUGE";
+
                 if (!first_append)
                     oss << ",";
                 _falcon_metric.encode_json_state(oss);
                 first_append = false;
             });
         oss << "]";
-
+        ddebug("oss look at here %s", oss.str().c_str());
         update_counters_to_falcon(oss.str(), timestamp);
+    }
+
+    if(_enable_prometheus) {
+
+        using namespace prometheus;
+        const auto labels = Gateway::GetInstanceLabel(GetHostName());
+        Gateway gateway{_prometheus_host, std::to_string(_prometheus_port), "sample_client", labels};
+        auto registry = std::make_shared<Registry>();
+
+        perf_counters::instance().iterate_snapshot(
+            [&registry, this](const dsn::perf_counters::counter_snapshot &cs) {
+                std::string myName = cs.name;
+                
+                replace(myName.begin(),myName.end(),'@',':');
+                replace(myName.begin(),myName.end(),'.','_');
+                replace(myName.begin(),myName.end(),'*','_');
+                replace(myName.begin(),myName.end(),'(','_');
+                replace(myName.begin(),myName.end(),')','_');
+                ddebug("%s", cs.name.c_str());
+                ddebug("myName = %s", myName.c_str());
+                
+                std::string app[3] = {"", "", ""};
+                std::vector<std::string> ret = s_split(myName, ":");
+                if(ret.size() > 1){
+                    std::vector<std::string> ret1 = s_split(ret[1], "_");
+                    for(int i = 0; i < ret1.size(); i++){
+                        app[i] = ret1[i];
+                        ddebug("split = %s", ret1[i].c_str());
+                    }
+                }
+                auto& gauge_family_all = BuildGauge()
+                                        .Name(myName)
+                                        .Labels(
+                                            {{"service","pegasus"},{"cluster",_cluster_name},{"job",_app_name},{"port",std::to_string(_local_port)}})
+                                        .Register(*registry);
+                auto& second_gauge_all = gauge_family_all.Add({{"app_id",app[0]},{"partition_id",app[1]},{"percent",app[2]}}
+                    );
+
+                second_gauge_all.Set(cs.value);
+            });
+
+        gateway.RegisterCollectable(registry);
+        gateway.Push();
     }
 
     ddebug("update now_ms(%lld), last_report_time_ms(%lld)", now, _last_report_time_ms);
@@ -192,6 +285,7 @@ void pegasus_counter_reporter::http_post_request(const std::string &host,
                                                  const std::string &contentType,
                                                  const std::string &data)
 {
+    ddebug("start update_request, %s", data.c_str());
     dinfo("start update_request, %s", data.c_str());
     struct event_base *base = event_base_new();
     struct evhttp_connection *conn = evhttp_connection_base_new(base, nullptr, host.c_str(), port);
@@ -247,5 +341,6 @@ void pegasus_counter_reporter::on_report_timer(std::shared_ptr<boost::asio::dead
         dassert(false, "pegasus report timer error!!!");
     }
 }
+
 }
 } // namespace
